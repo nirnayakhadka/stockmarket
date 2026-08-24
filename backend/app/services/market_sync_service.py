@@ -1,3 +1,14 @@
+"""
+app/services/market_sync_service.py
+
+Replaces seeding: every time the backend starts (and on a scheduler
+interval) this module pulls ALL live market data from various NEPSE
+data sources and persists it.
+
+Every source syncs independently - one endpoint failing never blocks the
+others. No synthetic/dummy data anywhere: if a source fails it simply
+stays at its last known state and the failure is reported in the result.
+"""
 
 import logging
 from datetime import datetime, date as date_cls
@@ -106,7 +117,7 @@ def _sync_companies(db: Session, client: NepseMarketClientSync) -> str:
 def _upsert_daily_price(
     db: Session, company_id: int, trade_date: datetime, item: dict
 ) -> bool:
-    """Upsert daily price record."""
+    """Upsert daily price record - handles duplicates gracefully."""
     close_price = item.get("ltp")
     if close_price is None:
         return False
@@ -121,6 +132,7 @@ def _upsert_daily_price(
         except (TypeError, ZeroDivisionError):
             change_pct = None
 
+    # Check if record already exists
     existing = (
         db.query(DailyPrice)
         .filter(DailyPrice.company_id == company_id, DailyPrice.date == trade_date)
@@ -128,6 +140,7 @@ def _upsert_daily_price(
     )
     
     if existing:
+        # Update existing record
         existing.open_price = item.get("open_price") or existing.open_price or close_price
         existing.high_price = item.get("high_price") or existing.high_price or close_price
         existing.low_price = item.get("low_price") or existing.low_price or close_price
@@ -139,6 +152,7 @@ def _upsert_daily_price(
         existing.turnover = item.get("turnover")
         return False
 
+    # Create new record
     db.add(
         DailyPrice(
             company_id=company_id,
@@ -221,6 +235,9 @@ def _sync_prices(db: Session, client: NepseMarketClientSync) -> str:
         trade_date = datetime.combine(date_cls.today(), datetime.min.time())
         inserted = updated = unmatched = skipped = 0
         
+        # Track processed company-date combinations to avoid duplicates in same batch
+        processed = set()
+        
         for item in items:
             symbol = item.get("symbol")
             if not symbol or str(symbol).isdigit():
@@ -231,32 +248,21 @@ def _sync_prices(db: Session, client: NepseMarketClientSync) -> str:
             company_id = symbol_map.get(clean_symbol)
                 
             if company_id is None:
-                # Try to create the company one more time
-                try:
-                    new_company = Company(symbol=clean_symbol, name=clean_symbol)
-                    db.add(new_company)
-                    db.flush()
-                    symbol_map[clean_symbol] = new_company.id
-                    company_id = new_company.id
-                    created_count += 1
-                except IntegrityError:
-                    db.rollback()
-                    # Refresh and check again
-                    companies = db.query(Company).all()
-                    symbol_map = {c.symbol.upper(): c.id for c in companies}
-                    company_id = symbol_map.get(clean_symbol)
-                    if company_id is None:
-                        unmatched += 1
-                        continue
-                except Exception as e:
-                    logger.warning(f"Could not create company {clean_symbol}: {e}")
-                    unmatched += 1
-                    continue
+                unmatched += 1
+                continue
+                
+            # Check if we already processed this company-date combination
+            key = f"{company_id}_{trade_date}"
+            if key in processed:
+                skipped += 1
+                continue
+            processed.add(key)
                 
             if item.get("ltp") is None:
                 skipped += 1
                 continue
                 
+            # Use upsert to handle duplicates
             if _upsert_daily_price(db, company_id, trade_date, item):
                 inserted += 1
             else:

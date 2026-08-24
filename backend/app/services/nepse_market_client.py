@@ -1,4 +1,7 @@
-
+"""
+NEPSE Market Client - Multiple data sources for reliable market data
+Uses: Sharesansar HTML, MeroLagani API, NEPSE Alpha, and other free sources
+"""
 
 import logging
 import json
@@ -24,7 +27,11 @@ DUMMY_DATA = [
 COMMON_SYMBOLS = [
     "NABIL", "NICA", "GBIME", "KBL", "MBL", "NIB", "NMB", "PCBL", "SBI", "SCB",
     "ADBL", "NBL", "RBB", "NCC", "CZBIL", "HBL", "EBL", "NIC", "KBL", "BK",
-    "CHCL", "SHIVM", "HDL", "NHPC", "API", "URJA", "UPCL", "NEPSE", "NIFRA"
+    "CHCL", "SHIVM", "HDL", "NHPC", "API", "URJA", "UPCL", "NEPSE", "NIFRA",
+    "NIBL", "SADBL", "NABIL", "NICA", "GBIME", "KBL", "MBL", "NIB", "NMB", "PCBL",
+    "SBI", "SCB", "ADBL", "NBL", "RBB", "NCC", "CZBIL", "HBL", "EBL", "NIC",
+    "CIT", "PRVU", "NFS", "NLIC", "GIL", "NHDL", "SHL", "SBL", "NBBL", "NLBBL",
+    "NABBC", "NICA", "GBIME", "KBL", "MBL", "NIB", "NMB", "PCBL", "SBI", "SCB"
 ]
 
 # Known working company symbols for fallback
@@ -49,6 +56,13 @@ FALLBACK_SYMBOLS = [
     {"symbol": "BK", "name": "Bank of Kathmandu"},
     {"symbol": "CHCL", "name": "Chilime Hydropower"},
     {"symbol": "SHIVM", "name": "Shivam Cements"},
+    {"symbol": "HDL", "name": "Himalayan Distillery"},
+    {"symbol": "NHPC", "name": "NeHPL"},
+    {"symbol": "API", "name": "API Power"},
+    {"symbol": "URJA", "name": "Urja Energy"},
+    {"symbol": "UPCL", "name": "Upper Chamod"},
+    {"symbol": "NEPSE", "name": "NEPSE Index"},
+    {"symbol": "NIFRA", "name": "Nepal Infrastructure Bank"},
 ]
 
 
@@ -68,9 +82,10 @@ def _num(row: dict, *keys) -> Optional[float]:
 class NepseMarketClient:
     """
     NEPSE Market Client with multiple data sources:
-    1. Sharesansar HTML parsing (primary)
-    2. NEPSE Alpha API (fallback)
-    3. Mock data for development (last resort)
+    1. Sharesansar HTML parsing
+    2. MeroLagani API
+    3. NEPSE Alpha API
+    4. Mock data for development (last resort)
     """
     
     def __init__(self):
@@ -80,6 +95,7 @@ class NepseMarketClient:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
         ]
         self.current_user_agent_index = 0
         
@@ -161,16 +177,36 @@ class NepseMarketClient:
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Try multiple table selectors
-                tables = soup.find_all('table')
                 market_data = []
                 
-                for table in tables:
+                # Try multiple methods to find market data
+                
+                # Method 1: Look for table with id 'market-data'
+                table = soup.find('table', {'id': 'market-data'})
+                if not table:
+                    # Method 2: Look for table with class 'table'
+                    table = soup.find('table', {'class': 'table'})
+                if not table:
+                    # Method 3: Look for any table with stock data
+                    tables = soup.find_all('table')
+                    for t in tables:
+                        rows = t.find_all('tr')
+                        if len(rows) > 1:
+                            # Check if first row has headers like 'Symbol', 'LTP', etc.
+                            header_row = rows[0]
+                            headers = [h.text.strip().lower() for h in header_row.find_all('th')]
+                            if any(h in ['symbol', 'ltp', 'company'] for h in headers):
+                                table = t
+                                break
+                
+                if table:
                     rows = table.find_all('tr')
-                    for row in rows:
+                    
+                    # Skip header row
+                    start_idx = 1
+                    for row in rows[start_idx:]:
                         cells = row.find_all('td')
-                        if len(cells) >= 6:
+                        if len(cells) >= 4:
                             try:
                                 symbol = cells[0].text.strip()
                                 
@@ -179,14 +215,16 @@ class NepseMarketClient:
                                     continue
                                 if len(symbol) < 2:
                                     continue
-                                if not symbol.isalpha():
+                                
+                                # Skip common non-stock headers
+                                if symbol.lower() in ['symbol', 'company', 'ltp', 'volume']:
                                     continue
                                 
                                 market_data.append({
-                                    "symbol": symbol,
-                                    "ltp": self._parse_float(cells[1].text),
-                                    "change": self._parse_float(cells[2].text),
-                                    "volume": self._parse_int(cells[3].text),
+                                    "symbol": symbol.upper(),
+                                    "ltp": self._parse_float(cells[1].text) if len(cells) > 1 else 0,
+                                    "change": self._parse_float(cells[2].text) if len(cells) > 2 else 0,
+                                    "volume": self._parse_int(cells[3].text) if len(cells) > 3 else 0,
                                     "turnover": self._parse_float(cells[4].text) if len(cells) > 4 else 0,
                                     "open": self._parse_float(cells[5].text) if len(cells) > 5 else 0,
                                     "high": self._parse_float(cells[6].text) if len(cells) > 6 else 0,
@@ -195,17 +233,105 @@ class NepseMarketClient:
                             except Exception as e:
                                 continue
                 
+                # Method 4: Look for market data in divs (alternative structure)
+                if not market_data:
+                    market_divs = soup.find_all('div', {'class': 'market-data'})
+                    for div in market_divs:
+                        rows = div.find_all('div', {'class': 'row'})
+                        for row in rows:
+                            cells = row.find_all('div', {'class': 'col'})
+                            if len(cells) >= 4:
+                                try:
+                                    symbol = cells[0].text.strip()
+                                    if symbol and not symbol.isdigit() and len(symbol) >= 2:
+                                        market_data.append({
+                                            "symbol": symbol.upper(),
+                                            "ltp": self._parse_float(cells[1].text),
+                                            "change": self._parse_float(cells[2].text),
+                                            "volume": self._parse_int(cells[3].text),
+                                        })
+                                except:
+                                    continue
+                
+                # Method 5: Try the API endpoint directly
+                if not market_data:
+                    try:
+                        api_url = "https://www.sharesansar.com/api/market-data"
+                        api_response = await self._client.get(api_url)
+                        if api_response.status_code == 200:
+                            api_data = api_response.json()
+                            if api_data and api_data.get('data'):
+                                for item in api_data['data']:
+                                    symbol = item.get('symbol')
+                                    if symbol and not str(symbol).isdigit():
+                                        market_data.append({
+                                            "symbol": symbol.upper(),
+                                            "ltp": self._parse_float(item.get('ltp', 0)),
+                                            "change": self._parse_float(item.get('change', 0)),
+                                            "volume": self._parse_int(item.get('volume', 0)),
+                                            "turnover": self._parse_float(item.get('turnover', 0)),
+                                            "open": self._parse_float(item.get('open', 0)),
+                                            "high": self._parse_float(item.get('high', 0)),
+                                            "low": self._parse_float(item.get('low', 0)),
+                                        })
+                    except:
+                        pass
+                
                 if market_data:
-                    logger.info(f"Sharesansar HTML returned {len(market_data)} valid items")
+                    # Remove duplicates by symbol
+                    seen = set()
+                    unique_data = []
+                    for item in market_data:
+                        if item["symbol"] not in seen:
+                            seen.add(item["symbol"])
+                            unique_data.append(item)
+                    
+                    logger.info(f"Sharesansar HTML returned {len(unique_data)} valid items")
                     return {
-                        "market_data": market_data,
+                        "market_data": unique_data,
                         "source": "sharesansar_html"
                     }
         except Exception as e:
             logger.error(f"Sharesansar HTML parsing error: {e}")
         return None
     
-    # ============ Data Source 2: NEPSE Alpha ============
+    # ============ Data Source 2: MeroLagani API ============
+    
+    async def _fetch_merolagani_api(self) -> Dict:
+        """Fetch market data from MeroLagani API."""
+        try:
+            url = "https://parseapi.net/api/merolagani/market-summary"
+            self._rotate_user_agent()
+            response = await self._client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data and data.get("data"):
+                    market_data = []
+                    for item in data["data"]:
+                        symbol = item.get("symbol")
+                        if symbol and not str(symbol).isdigit():
+                            market_data.append({
+                                "symbol": symbol.upper(),
+                                "ltp": self._parse_float(item.get("ltp", 0)),
+                                "change": self._parse_float(item.get("change", 0)),
+                                "volume": self._parse_int(item.get("volume", 0)),
+                                "turnover": self._parse_float(item.get("turnover", 0)),
+                                "open": self._parse_float(item.get("open", 0)),
+                                "high": self._parse_float(item.get("high", 0)),
+                                "low": self._parse_float(item.get("low", 0)),
+                            })
+                    if market_data:
+                        logger.info(f"MeroLagani API returned {len(market_data)} items")
+                        return {
+                            "market_data": market_data,
+                            "source": "merolagani"
+                        }
+        except Exception as e:
+            logger.debug(f"MeroLagani API error: {e}")
+        return None
+    
+    # ============ Data Source 3: NEPSE Alpha ============
     
     async def _parse_nepsealpha_html(self) -> Dict:
         """Parse market data from nepsealpha.com."""
@@ -229,7 +355,7 @@ class NepseMarketClient:
                                 symbol = cells[0].text.strip()
                                 if symbol and not str(symbol).isdigit():
                                     market_data.append({
-                                        "symbol": symbol,
+                                        "symbol": symbol.upper(),
                                         "ltp": self._parse_float(cells[1].text),
                                         "change": self._parse_float(cells[2].text),
                                         "volume": self._parse_int(cells[3].text),
@@ -247,7 +373,40 @@ class NepseMarketClient:
             logger.error(f"NEPSE Alpha parsing error: {e}")
         return None
     
-    # ============ Data Source 3: Mock Data (Fallback) ============
+    # ============ Data Source 4: NEPSE Alpha API ============
+    
+    async def _fetch_nepse_alpha_api(self) -> Dict:
+        """Fetch market data from NEPSE Alpha API."""
+        try:
+            url = "https://nepsealpha.com/api/market-data"
+            self._rotate_user_agent()
+            response = await self._client.get(url)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if data and data.get("data"):
+                    market_data = []
+                    for item in data["data"]:
+                        symbol = item.get("symbol")
+                        if symbol and not str(symbol).isdigit():
+                            market_data.append({
+                                "symbol": symbol.upper(),
+                                "ltp": self._parse_float(item.get("ltp", 0)),
+                                "change": self._parse_float(item.get("change", 0)),
+                                "volume": self._parse_int(item.get("volume", 0)),
+                                "turnover": self._parse_float(item.get("turnover", 0)),
+                            })
+                    if market_data:
+                        logger.info(f"NEPSE Alpha API returned {len(market_data)} items")
+                        return {
+                            "market_data": market_data,
+                            "source": "nepse_alpha_api"
+                        }
+        except Exception as e:
+            logger.debug(f"NEPSE Alpha API error: {e}")
+        return None
+    
+    # ============ Data Source 5: Mock Data (Fallback) ============
     
     def _generate_mock_data(self) -> Dict:
         """Generate mock market data for development."""
@@ -255,7 +414,7 @@ class NepseMarketClient:
         
         import random
         market_data = []
-        for symbol in COMMON_SYMBOLS[:20]:
+        for symbol in COMMON_SYMBOLS[:30]:
             base_price = random.uniform(100, 5000)
             change = random.uniform(-10, 10)
             market_data.append({
@@ -324,6 +483,8 @@ class NepseMarketClient:
         # Try different data sources in order
         sources = [
             self._parse_sharesansar_html,
+            self._fetch_merolagani_api,
+            self._fetch_nepse_alpha_api,
             self._parse_nepsealpha_html,
         ]
         
@@ -332,7 +493,7 @@ class NepseMarketClient:
                 result = await source()
                 if result and result.get("market_data"):
                     data = self._process_market_data(result.get("market_data"))
-                    if data:
+                    if data and len(data) > 5:  # Only use if we got enough data
                         self._set_cache(cache_key, data, ttl=60)
                         logger.info(f"✅ Fetched {len(data)} prices from {result.get('source', 'unknown')}")
                         return data
@@ -373,7 +534,7 @@ class NepseMarketClient:
                         if '/company/' in href:
                             symbol = href.split('/')[-1]
                             if symbol and not str(symbol).isdigit():
-                                symbols.append({"symbol": symbol, "name": link.text.strip()})
+                                symbols.append({"symbol": symbol.upper(), "name": link.text.strip()})
                 
                 if symbols:
                     # Remove duplicates
@@ -420,7 +581,7 @@ class NepseMarketClient:
                             symbol = cells[0].text.strip()
                             if symbol and not str(symbol).isdigit():
                                 content.append({
-                                    "symbol": symbol,
+                                    "symbol": symbol.upper(),
                                     "buyerBroker": cells[1].text.strip(),
                                     "sellerBroker": cells[2].text.strip(),
                                     "quantity": self._parse_int(cells[3].text),
@@ -450,7 +611,29 @@ class NepseMarketClient:
             return cached
         
         try:
-            # Try to get from sharesansar
+            # Try MeroLagani for indices
+            url = "https://parseapi.net/api/merolagani/index-data"
+            response = await self._client.get(url)
+            if response.status_code == 200:
+                data = response.json()
+                if data:
+                    indices = []
+                    for item in data:
+                        if item.get("name"):
+                            indices.append({
+                                "name": item.get("name"),
+                                "value": self._parse_float(item.get("value", 0)),
+                                "point_change": self._parse_float(item.get("change", 0)),
+                                "pct_change": self._parse_float(item.get("percentChange", 0)),
+                            })
+                    if indices:
+                        self._set_cache(cache_key, indices, ttl=60)
+                        return indices
+        except Exception as e:
+            logger.debug(f"Indices fetch error: {e}")
+        
+        # Try sharesansar
+        try:
             url = "https://www.sharesansar.com/"
             response = await self._client.get(url)
             if response.status_code == 200:
@@ -493,31 +676,24 @@ class NepseMarketClient:
             return cached
         
         try:
-            # Try to get from sharesansar
-            url = "https://www.sharesansar.com/brokers"
+            # Try MeroLagani for brokers
+            url = "https://parseapi.net/api/merolagani/brokers"
             response = await self._client.get(url)
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                members = []
-                
-                table = soup.find('table')
-                if table:
-                    rows = table.find_all('tr')
-                    for row in rows[1:]:
-                        cells = row.find_all('td')
-                        if len(cells) >= 2:
-                            code = cells[0].text.strip()
-                            name = cells[1].text.strip()
-                            if code and not str(code).isdigit():
-                                members.append({
-                                    "code": code,
-                                    "name": name,
-                                    "city": cells[2].text.strip() if len(cells) > 2 else None,
-                                })
-                
-                if members:
-                    self._set_cache(cache_key, members, ttl=3600)
-                    return members
+                data = response.json()
+                if data:
+                    members = []
+                    for item in data:
+                        code = item.get("code")
+                        if code and not str(code).isdigit():
+                            members.append({
+                                "code": str(code),
+                                "name": item.get("name", f"Broker {code}"),
+                                "city": item.get("city"),
+                            })
+                    if members:
+                        self._set_cache(cache_key, members, ttl=3600)
+                        return members
         except Exception as e:
             logger.debug(f"Members fetch error: {e}")
         
@@ -540,27 +716,24 @@ class NepseMarketClient:
             return cached
         
         try:
-            # Try to get from sharesansar
-            url = "https://www.sharesansar.com/news"
+            # Try MeroLagani for news
+            url = "https://parseapi.net/api/merolagani/news"
             response = await self._client.get(url)
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                bulletins = []
-                
-                # Find news items
-                news_items = soup.find_all('div', {'class': 'news-item'})
-                for item in news_items[:20]:
-                    title_elem = item.find('a')
-                    if title_elem:
-                        bulletins.append({
-                            "title": title_elem.text.strip(),
-                            "url": title_elem.get('href'),
-                            "published_on": datetime.now().isoformat(),
-                        })
-                
-                if bulletins:
-                    self._set_cache(cache_key, bulletins, ttl=600)
-                    return bulletins
+                data = response.json()
+                if data:
+                    bulletins = []
+                    for item in data:
+                        title = item.get("title")
+                        if title:
+                            bulletins.append({
+                                "title": title,
+                                "url": item.get("url"),
+                                "published_on": item.get("date"),
+                            })
+                    if bulletins:
+                        self._set_cache(cache_key, bulletins, ttl=600)
+                        return bulletins
         except Exception as e:
             logger.debug(f"News bulletin fetch error: {e}")
         
@@ -606,38 +779,31 @@ class NepseMarketClient:
         if cached is not None:
             return cached
         
-        # Try to get from sharesansar
         try:
-            url = "https://www.sharesansar.com/history"
+            # Try MeroLagani for history
+            url = "https://parseapi.net/api/merolagani/history"
             response = await self._client.get(url)
             if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                history = []
-                
-                table = soup.find('table')
-                if table:
-                    rows = table.find_all('tr')
-                    for row in rows[1:30]:  # Get last 30 days
-                        cells = row.find_all('td')
-                        if len(cells) >= 2:
-                            date = cells[0].text.strip()
-                            value = self._parse_float(cells[1].text)
-                            if date and value:
-                                history.append({
-                                    "name": "NEPSE Index",
-                                    "value": value,
-                                    "business_date": date,
-                                    "point_change": None,
-                                    "turnover": None,
-                                })
-                
-                if history:
-                    self._set_cache(cache_key, history, ttl=3600)
-                    return history
+                data = response.json()
+                if data:
+                    history = []
+                    for item in data:
+                        date = item.get("date")
+                        value = item.get("value")
+                        if date and value:
+                            history.append({
+                                "name": "NEPSE Index",
+                                "value": self._parse_float(value),
+                                "business_date": date,
+                                "point_change": self._parse_float(item.get("change", 0)),
+                                "turnover": self._parse_float(item.get("turnover", 0)),
+                            })
+                    if history:
+                        self._set_cache(cache_key, history, ttl=3600)
+                        return history
         except Exception as e:
             logger.debug(f"Price history fetch error: {e}")
         
-        # Return empty list
         return []
     
     async def fetch_index_ceil_floor(self) -> Dict[str, Dict]:
@@ -672,7 +838,7 @@ class NepseMarketClient:
                     continue
                 
                 processed.append({
-                    "symbol": str(symbol).strip(),
+                    "symbol": str(symbol).strip().upper(),
                     "ltp": _num(item, "ltp", "lastTradedPrice", "close", "price"),
                     "open_price": _num(item, "open", "openPrice", "open_price"),
                     "high_price": _num(item, "high", "highPrice", "high_price"),
