@@ -86,7 +86,7 @@ class DailyPrice(Base):
         UniqueConstraint("company_id", "date", name="uq_company_date"),
         Index("ix_daily_prices_company_date", "company_id", "date"),
     )
-    
+
     id = Column(Integer, primary_key=True, index=True)
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
     date = Column(DateTime, nullable=False)
@@ -94,9 +94,12 @@ class DailyPrice(Base):
     high_price = Column(DECIMAL(20, 4), nullable=False)
     low_price = Column(DECIMAL(20, 4), nullable=False)
     close_price = Column(DECIMAL(20, 4), nullable=False)
+    prev_close = Column(DECIMAL(20, 4), nullable=True)
+    change_pct = Column(DECIMAL(10, 4), nullable=True)
+    transactions = Column(Integer, nullable=True)
     volume = Column(Integer, nullable=False)
     turnover = Column(DECIMAL(20, 2), nullable=True)
-    
+
     # Relationships
     company = relationship("Company", back_populates="daily_prices")
 
@@ -211,8 +214,93 @@ class BrokerActivitySummary(Base):
     company = relationship("Company")
 
 
-# --- User & RBAC Models ---
+# --- Live Market Models (populated from nepalstock.com.np NOTS API) ---
 
+class MarketIndexSnapshot(Base):
+    """Snapshot of a NEPSE index captured at each market-data sync.
+
+    One row per index per sync (and, on first startup, one row per
+    business date from the /nepse-price history endpoint so index charts
+    have data immediately).
+    """
+    __tablename__ = "market_index_snapshots"
+    __table_args__ = (
+        UniqueConstraint("index_name", "business_date", name="uq_market_index_name_date"),
+        Index("ix_market_index_captured", "captured_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    index_name = Column(String(120), nullable=False)
+    value = Column(DECIMAL(20, 4), nullable=True)
+    point_change = Column(DECIMAL(20, 4), nullable=True)
+    pct_change = Column(DECIMAL(10, 4), nullable=True)
+    open_value = Column(DECIMAL(20, 4), nullable=True)
+    high_value = Column(DECIMAL(20, 4), nullable=True)
+    low_value = Column(DECIMAL(20, 4), nullable=True)
+    prev_close = Column(DECIMAL(20, 4), nullable=True)
+    turnover = Column(DECIMAL(24, 2), nullable=True)
+    ceil = Column(DECIMAL(20, 4), nullable=True)
+    floor = Column(DECIMAL(20, 4), nullable=True)
+    business_date = Column(DateTime, nullable=False)
+    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class MarketStatus(Base):
+    """Single-row (id=1) mirror of the official market-open flag."""
+    __tablename__ = "market_status"
+
+    id = Column(Integer, primary_key=True, index=True)
+    is_open = Column(Boolean, default=False, nullable=False)
+    is_open_raw = Column(String(20), nullable=True)
+    as_of = Column(String(64), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class TopTurnoverScrip(Base):
+    """Rows of the official top-ten-turnover-scrips endpoint."""
+    __tablename__ = "top_turnover_scrips"
+    __table_args__ = (
+        UniqueConstraint("symbol", "business_date", name="uq_top_scrip_symbol_date"),
+        Index("ix_top_scrip_date", "business_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    ltp = Column(DECIMAL(20, 4), nullable=True)
+    point_change = Column(DECIMAL(20, 4), nullable=True)
+    pct_change = Column(DECIMAL(10, 4), nullable=True)
+    amount = Column(DECIMAL(24, 2), nullable=True)
+    rank = Column(Integer, nullable=True)
+    business_date = Column(DateTime, nullable=False)
+    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class NewsBulletinItem(Base):
+    """Official NEPSE news bulletins (market announcements)."""
+    __tablename__ = "news_bulletin_items"
+    __table_args__ = (
+        UniqueConstraint("title", "published_on", name="uq_bulletin_title_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(512), nullable=False)
+    published_on = Column(DateTime, nullable=True)
+    source_url = Column(String(1024), nullable=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class BrokerInfo(Base):
+    """NEPSE trading members (brokers) from the /member endpoint."""
+    __tablename__ = "broker_infos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    broker_code = Column(String(20), unique=True, nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    city = Column(String(100), nullable=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+# --- User & RBAC Models ---
 class UserRole(str, enum.Enum):
     admin = "admin"
     analyst = "analyst"

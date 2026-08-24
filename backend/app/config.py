@@ -10,7 +10,13 @@ class Settings(BaseSettings):
     
     enable_scheduler: bool = False
     crawl_schedule_cron_hour: str = "6,12,18"
-    
+
+    # Live market sync (replaces seeding): runs once at startup and then
+    # on an interval so prices/indices/floorsheet stay current.
+    enable_startup_market_sync: bool = True
+    market_sync_interval_minutes: int = 5
+    floorsheet_max_pages: int = 2
+
     secret_key: str = "your-secret-key-change-in-production"
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 30

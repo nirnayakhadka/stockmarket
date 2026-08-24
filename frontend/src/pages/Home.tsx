@@ -8,16 +8,41 @@ import {
   EmptyState,
 } from "../components/States";
 import { useAsync } from "../hooks/useAsync";
-import { fetchMarketOverview, latestQuote } from "../api/market";
-import type { CompanyMarketRow } from "../api/market";
+import {
+  fetchMarketQuotes,
+  fetchMarketSummary,
+  quoteChangePct,
+} from "../api/market";
+import type {
+  MarketQuoteRow,
+  MarketSummaryResponse,
+  ScripStat,
+} from "../api/market";
 import { fetchNews, mapArticle } from "../api/mappers";
+import { fetchCompanies } from "../api/mappers";
 import type { NewsArticle } from "../types";
-import type { MarketOverview } from "../api/market";
 
-async function loadHome(): Promise<{ market: MarketOverview; news: NewsArticle[] }> {
-  const market = await fetchMarketOverview();
-  const raw = await fetchNews({ limit: 100 });
-  return { market, news: raw.map((a) => mapArticle(a, market.companies)) };
+async function loadHome(): Promise<{
+  summary: MarketSummaryResponse;
+  rows: MarketQuoteRow[];
+  news: NewsArticle[];
+}> {
+  const [summary, quotesRes, raw, companies] = await Promise.all([
+    fetchMarketSummary(),
+    fetchMarketQuotes(),
+    fetchNews({ limit: 100 }),
+    fetchCompanies(),
+  ]);
+  const news = raw.map((a) => mapArticle(a, companies));
+  return { summary, rows: quotesRes.quotes, news };
+}
+
+function nepseIndex(summary: MarketSummaryResponse) {
+  return (
+    summary.indices.find((i) => i.index_name === "NEPSE Index") ??
+    summary.indices[0] ??
+    null
+  );
 }
 
 export default function Home() {
@@ -34,29 +59,15 @@ export default function Home() {
     );
   if (!data) return null;
 
-  const { market, news } = data;
-  const quotes = market.rows
-    .map((row) => ({ row, quote: latestQuote(row) }))
-    .filter((q) => q.quote !== null);
+  const { summary, rows, news } = data;
+  const idx = nepseIndex(summary);
+  const quotes = rows.filter((r) => r.quote !== null);
 
-  const gainers = [...quotes]
-    .filter((q) => q.quote!.changePct !== null)
-    .sort((a, b) => b.quote!.changePct! - a.quote!.changePct!)
-    .slice(0, 3);
-  const losers = [...quotes]
-    .filter((q) => q.quote!.changePct !== null)
-    .sort((a, b) => a.quote!.changePct! - b.quote!.changePct!)
-    .slice(0, 3);
-  const mostActive = [...quotes]
-    .sort((a, b) => b.quote!.volume - a.quote!.volume)
-    .slice(0, 3);
+  const gainers = summary.gainers.slice(0, 3);
+  const losers = summary.losers.slice(0, 3);
+  const mostActive = summary.volume_leaders.slice(0, 3);
 
-  const totalVolume = quotes.reduce((sum, q) => sum + q.quote!.volume, 0);
-  const advancers = quotes.filter((q) => (q.quote!.changePct ?? 0) > 0).length;
-  const decliners = quotes.filter((q) => (q.quote!.changePct ?? 0) < 0).length;
-  const anomalyCompanies = market.rows.filter(
-    (r) => (r.summary?.anomalies?.count ?? 0) > 0,
-  ).length;
+  const { advancers, decliners, total_volume: totalVolume } = summary.breadth;
 
   return (
     <div>
@@ -64,22 +75,22 @@ export default function Home() {
       <div className="mb-6 overflow-hidden rounded-xl border border-panel-border bg-panel">
         <div className="flex items-center gap-5 overflow-x-auto px-4 py-2.5">
           <span className="shrink-0 text-[10px] font-bold uppercase tracking-widest text-accent">
-            Watchlist
+            NEPSE
           </span>
           {quotes.length === 0 && !loading && (
             <span className="text-xs text-muted">No trading data yet</span>
           )}
-          {quotes.map(({ row, quote }) => (
+          {quotes.map((row) => (
             <Link
-              key={row.company.id}
-              to={`/companies/${row.company.id}`}
+              key={row.company_id}
+              to={`/companies/${row.company_id}`}
               className="flex shrink-0 items-center gap-2 text-xs"
             >
-              <span className="font-semibold">{row.company.symbol}</span>
+              <span className="font-semibold">{row.symbol}</span>
               <span className="tabular-nums text-muted">
-                Rs {quote!.price.toFixed(2)}
+                Rs {row.quote!.price.toFixed(2)}
               </span>
-              <ChangeBadge pct={quote!.changePct} arrow={false} className="text-[11px]" />
+              <ChangeBadge pct={quoteChangePct(row)} arrow={false} className="text-[11px]" />
             </Link>
           ))}
         </div>
@@ -87,26 +98,48 @@ export default function Home() {
 
       {/* Hero */}
       <section className="mb-6 rounded-2xl border border-panel-border bg-gradient-to-br from-panel via-panel to-[#131722] px-6 py-7 sm:px-8">
-        <h1 className="max-w-xl text-2xl font-semibold leading-snug sm:text-[28px]">
-          Track the Nepal Stock Exchange —{" "}
-          <span className="text-accent">prices, volume and news</span> in one
-          dashboard.
-        </h1>
-        <p className="mt-2 max-w-2xl text-sm leading-relaxed text-muted">
-          Live view of your tracked companies across banking, insurance,
-          hydropower, manufacturing and hotels — powered by crawled news and
-          daily OHLCV data.
-        </p>
+        <div className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <h1 className="max-w-xl text-2xl font-semibold leading-snug sm:text-[28px]">
+              Track the Nepal Stock Exchange —{" "}
+              <span className="text-accent">prices, volume and news</span> in
+              one dashboard.
+            </h1>
+            <p className="mt-2 max-w-2xl text-sm leading-relaxed text-muted">
+              Live view of every listed company across banking, insurance,
+              hydropower, manufacturing and hotels — synced directly from the
+              official NEPSE feed.
+            </p>
+          </div>
+          {idx && (
+            <div className="rounded-xl border border-panel-border bg-[#1a1f29] px-5 py-3 text-right">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-muted">
+                {idx.index_name}
+              </div>
+              <div className="text-2xl font-semibold tabular-nums">
+                {idx.value?.toLocaleString() ?? "—"}
+              </div>
+              <ChangeBadge pct={idx.pct_change} />
+              {idx.business_date && (
+                <div className="mt-0.5 text-[10px] text-muted">
+                  as of {idx.business_date}
+                  {summary.status.is_open ? " • market open" : ""}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </section>
 
       {/* Market stats */}
       <section className="mb-6 grid grid-cols-2 gap-3.5 lg:grid-cols-4">
         <StatCard label="Advancers" value={advancers} sublabel={`${decliners} decliners`} tone="positive" />
         <StatCard label="Decliners" value={decliners} sublabel={`${advancers} advancers`} tone={decliners > advancers ? "negative" : undefined} />
-        <StatCard label="Total volume (last day)" value={totalVolume.toLocaleString()} />
+        <StatCard label="Total volume" value={totalVolume.toLocaleString()} sublabel={summary.trade_date ?? undefined} />
         <StatCard
-          label="Volume anomalies (30d)"
-          value={`${anomalyCompanies} / ${market.rows.length} companies`}
+          label="Total turnover"
+          value={`Rs ${Math.round(summary.breadth.total_turnover).toLocaleString()}`}
+          sublabel={`${rows.length} listed companies`}
         />
       </section>
 
@@ -185,8 +218,8 @@ export default function Home() {
         </section>
       </div>
 
-      {/* Watchlist table */}
-      <CompanyTableSection rows={market.rows} showAll />
+      {/* All companies table */}
+      <CompanyTableSection rows={rows} showAll />
     </div>
   );
 }
@@ -195,30 +228,31 @@ function MoverList({
   rows,
   metric = "change",
 }: {
-  rows: { row: CompanyMarketRow; quote: ReturnType<typeof latestQuote> }[];
+  rows: ScripStat[];
   metric?: "change" | "volume";
 }) {
-  if (rows.length === 0) return <p className="py-4 text-xs text-muted">No data</p>;
+  if (rows.length === 0)
+    return <p className="py-4 text-xs text-muted">No data</p>;
   return (
     <ul className="flex flex-col gap-2">
-      {rows.map(({ row, quote }) => (
-        <li key={row.company.id}>
+      {rows.map((s) => (
+        <li key={s.symbol}>
           <Link
-            to={`/companies/${row.company.id}`}
+            to={`/companies/${s.company_id}`}
             className="flex items-center justify-between rounded-lg px-2 py-1.5 transition hover:bg-[#1e2430]"
           >
             <div>
-              <div className="text-sm font-semibold">{row.company.symbol}</div>
+              <div className="text-sm font-semibold">{s.symbol}</div>
               <div className="line-clamp-1 max-w-[160px] text-[11px] text-muted">
-                {row.company.name}
+                {s.name}
               </div>
             </div>
             {metric === "volume" ? (
               <span className="text-xs tabular-nums text-muted">
-                {quote!.volume.toLocaleString()}
+                {s.volume.toLocaleString()}
               </span>
             ) : (
-              <ChangeBadge pct={quote!.changePct} />
+              <ChangeBadge pct={s.change_pct} />
             )}
           </Link>
         </li>
@@ -231,17 +265,19 @@ export function CompanyTableSection({
   rows,
   showAll = false,
 }: {
-  rows: CompanyMarketRow[];
+  rows: MarketQuoteRow[];
   showAll?: boolean;
 }) {
   const sorted = [...rows].sort((a, b) =>
-    a.company.symbol.localeCompare(b.company.symbol),
+    a.symbol.localeCompare(b.symbol),
   );
 
   return (
     <section className="rounded-xl border border-panel-border bg-panel px-5 py-4.5">
       <div className="mb-3.5 flex items-center justify-between">
-        <h2 className="text-[15px] font-semibold">Watchlist snapshot</h2>
+        <h2 className="text-[15px] font-semibold">
+          {showAll ? "All listed companies" : "Watchlist snapshot"}
+        </h2>
         {!showAll && (
           <Link to="/companies" className="text-xs text-accent hover:underline">
             All companies →
@@ -249,7 +285,10 @@ export function CompanyTableSection({
         )}
       </div>
       {sorted.length === 0 ? (
-        <EmptyState title="No companies found" hint="Seed companies via the backend scripts." />
+        <EmptyState
+          title="No companies found"
+          hint="The backend syncs companies automatically at startup from the official NEPSE list."
+        />
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full min-w-[720px] border-collapse">
@@ -269,38 +308,38 @@ export function CompanyTableSection({
             </thead>
             <tbody>
               {sorted.map((row) => {
-                const quote = latestQuote(row);
+                const q = row.quote;
                 return (
-                  <tr key={row.company.id} className="transition hover:bg-[#1a1f29]">
+                  <tr key={row.company_id} className="transition hover:bg-[#1a1f29]">
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5">
                       <div className="flex flex-col">
-                        <span className="text-sm font-semibold">{row.company.symbol}</span>
-                        <span className="text-xs text-muted">{row.company.name}</span>
+                        <span className="text-sm font-semibold">{row.symbol}</span>
+                        <span className="text-xs text-muted">{row.name}</span>
                       </div>
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm text-muted">
-                      {row.company.sector ?? "—"}
+                      {row.sector ?? "—"}
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
-                      {quote ? `Rs ${quote.price.toFixed(2)}` : "—"}
+                      {q ? `Rs ${q.price.toFixed(2)}` : "—"}
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm">
-                      <ChangeBadge pct={quote?.changePct ?? null} />
+                      <ChangeBadge pct={q?.change_pct ?? null} />
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
-                      {quote ? quote.volume.toLocaleString() : "—"}
+                      {q ? q.volume.toLocaleString() : "—"}
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-muted">
-                      {quote && quote.turnover > 0
-                        ? `Rs ${quote.turnover.toLocaleString()}`
+                      {q && q.turnover
+                        ? `Rs ${q.turnover.toLocaleString()}`
                         : "—"}
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-1.5">
-                      <Sparkline values={row.prices.map((p) => p.close)} />
+                      <Sparkline values={row.history.map((h) => h.close)} />
                     </td>
                     <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-right">
                       <Link
-                        to={`/companies/${row.company.id}`}
+                        to={`/companies/${row.company_id}`}
                         className="inline-block rounded-lg border border-panel-border bg-[#1e2430] px-2.5 py-1 text-xs font-medium transition hover:bg-[#262d3b]"
                       >
                         View
@@ -312,12 +351,6 @@ export function CompanyTableSection({
             </tbody>
           </table>
         </div>
-      )}
-      {sorted.some((r) => r.summary === null) && (
-        <p className="mt-3 text-xs text-muted">
-          Some companies lack enough price history for full behavior analysis —
-          their trend metrics show limited values.
-        </p>
       )}
     </section>
   );

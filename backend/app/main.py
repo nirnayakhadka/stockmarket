@@ -1,4 +1,5 @@
 import logging
+import threading
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -8,7 +9,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import settings
 from app.database import init_db
-from app.routers import news, admin, companies, prices, analysis, categorization,market_data_admin, auth, users, broker_activity
+from app.routers import news, admin, companies, prices, analysis, categorization,market_data_admin, auth, users, broker_activity, market
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nepse_crawler")
@@ -40,14 +41,44 @@ app.include_router(categorization.router)
 app.include_router(market_data_admin.router)
 app.include_router(auth.router)
 app.include_router(users.router)
-app.include_router(broker_activity.router) 
+app.include_router(broker_activity.router)
+app.include_router(market.router)
+
 @app.on_event("startup")
 def on_startup():
     init_db()
+    if settings.enable_startup_market_sync:
+        # Initial live-data sync in a background thread so the server
+        # binds immediately while NEPSE data (companies, prices, indices,
+        # floorsheet, brokers, bulletins...) populates the DB. This
+        # replaces the old seeding step entirely.
+        thread = threading.Thread(target=_startup_sync, name="market-sync-startup", daemon=True)
+        thread.start()
     if settings.enable_scheduler:
         from app.scheduler import start_scheduler
 
         start_scheduler()
+
+
+def _startup_sync():
+    from app.services.market_sync_service import sync_all_market_data
+
+    logger.info("Startup market data sync starting (replaces seeding)")
+    try:
+        result = sync_all_market_data(include_floorsheet=True)
+        failed = [k for k, v in result.items() if v.get("status") == "failed"]
+        for name, detail in result.items():
+            logger.info("Startup sync [%s]: %s", name, detail.get("detail") or detail.get("error"))
+        if failed:
+            logger.warning(
+                "Startup market sync completed with failures: %s "
+                "(NEPSE API may be unreachable from this network; the "
+                "scheduler will retry every %d minutes)",
+                failed,
+                settings.market_sync_interval_minutes,
+            )
+    except Exception:
+        logger.exception("Startup market sync failed")
 
 
 # --- Centralized error handling: no unhandled exception should ever

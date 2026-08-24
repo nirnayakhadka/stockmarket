@@ -1,42 +1,35 @@
 """
 app/routers/market_data_admin.py
 
-Admin trigger for real trading-data collection (section 1.2).
+Admin trigger for real trading-data collection.
 """
 
 from fastapi import APIRouter, BackgroundTasks, Depends
 
-from app.services.market_data_service import collect_all_market_data
+from app.services.market_sync_service import sync_all_market_data
 from app.auth_dependencies import require_role
 
 router = APIRouter(prefix="/api/admin/market-data", tags=["admin", "market-data"])
 
 
 @router.post("/collect", dependencies=[Depends(require_role("admin"))])
-async def trigger_market_data_collection(
+def trigger_market_data_collection(
     background_tasks: BackgroundTasks,
     include_floorsheet: bool = True,
 ):
     """
-    Triggers a real-data collection run against nepalstock.com.np for the
-    watchlist. Runs in the background — call this once daily via the
-    scheduler (see app/scheduler.py), or manually from here for testing/
-    on-demand refresh.
+    Triggers a full live-data sync against nepalstock.com.np in the
+    background. The same sync runs at startup and on the scheduler
+    interval; this endpoint exists for manual/on-demand refreshes.
     """
-    background_tasks.add_task(_run_collection, include_floorsheet)
+    background_tasks.add_task(sync_all_market_data, include_floorsheet)
     return {"status": "collection started", "include_floorsheet": include_floorsheet}
 
 
-async def _run_collection(include_floorsheet: bool):
-    result = await collect_all_market_data(include_floorsheet=include_floorsheet)
-    return result
-
-
 @router.post("/collect-sync", dependencies=[Depends(require_role("admin"))])
-async def trigger_market_data_collection_sync(include_floorsheet: bool = True):
+def trigger_market_data_collection_sync(include_floorsheet: bool = True):
     """
-    Same as /collect but waits for the result and returns it directly —
-    useful when testing from Swagger UI so you can see inserted/updated
-    counts immediately instead of polling.
+    Same as /collect but waits and returns per-source results directly -
+    useful from Swagger UI to see inserted/updated counts immediately.
     """
-    return await collect_all_market_data(include_floorsheet=include_floorsheet)
+    return sync_all_market_data(include_floorsheet=include_floorsheet)

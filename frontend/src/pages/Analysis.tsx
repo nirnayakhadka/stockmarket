@@ -16,10 +16,9 @@ import StatCard from "../components/StatCard";
 import ChangeBadge from "../components/ChangeBadge";
 import { LoadingState, ErrorState, EmptyState } from "../components/States";
 import { useAsync } from "../hooks/useAsync";
-import { fetchMarketOverview } from "../api/market";
-import type { CompanyMarketRow } from "../api/market";
-import { fetchNews, mapArticle } from "../api/mappers";
-import type { MarketOverview } from "../api/market";
+import { fetchMarketQuotes } from "../api/market";
+import type { MarketQuoteRow } from "../api/market";
+import { fetchCompanies, fetchNews, mapArticle } from "../api/mappers";
 
 const LINE_COLORS = [
   "#4fd1c5",
@@ -34,13 +33,29 @@ const LINE_COLORS = [
   "#f0fff4",
 ];
 
+const MAX_CHART_SERIES = 10;
+
+interface RowMetrics {
+  row: MarketQuoteRow;
+  totalChangePct: number | null;
+  avgDailyChange: number | null;
+  maxGain: number | null;
+  maxLoss: number | null;
+  avgVolume: number;
+  inNews: number;
+}
+
 async function loadAnalysis(): Promise<{
-  market: MarketOverview;
+  rows: MarketQuoteRow[];
+  metrics: RowMetrics[];
   newsCounts: Record<number, number>;
 }> {
-  const market = await fetchMarketOverview();
-  const raw = await fetchNews({ limit: 500 });
-  const articles = raw.map((a) => mapArticle(a, market.companies));
+  const [quotesRes, companies, raw] = await Promise.all([
+    fetchMarketQuotes(),
+    fetchCompanies(),
+    fetchNews({ limit: 500 }),
+  ]);
+  const articles = raw.map((a) => mapArticle(a, companies));
   const newsCounts: Record<number, number> = {};
   for (const article of articles) {
     for (const cid of article.companyIds) {
@@ -48,43 +63,76 @@ async function loadAnalysis(): Promise<{
       newsCounts[id] = (newsCounts[id] ?? 0) + 1;
     }
   }
-  return { market, newsCounts };
-}
 
-/** Cumulative % change per company normalized to 0 at the first common date. */
-function buildComparisonSeries(rows: CompanyMarketRow[]) {
-  const seriesByCompany = rows
-    .filter((r) => r.prices.length >= 2)
-    .map((r) => {
-      const base = r.prices[0].close || 1;
-      return {
-        company: r.company,
-        points: r.prices.map((p) => ({
-          date: p.date,
-          pct: ((p.close - base) / base) * 100,
-        })),
-      };
-    });
+  const metrics = quotesRes.quotes.map((row) => {
+    const hist = row.history;
+    let totalChangePct: number | null = null;
+    let avgDailyChange: number | null = null;
+    let maxGain: number | null = null;
+    let maxLoss: number | null = null;
+    if (hist.length >= 2) {
+      const base = hist[0].close || 1;
+      totalChangePct = ((hist[hist.length - 1].close - base) / base) * 100;
+      const daily: number[] = [];
+      for (let i = 1; i < hist.length; i++) {
+        const prev = hist[i - 1].close;
+        if (prev > 0)
+          daily.push(((hist[i].close - prev) / prev) * 100);
+      }
+      if (daily.length > 0) {
+        avgDailyChange = daily.reduce((s, v) => s + v, 0) / daily.length;
+        maxGain = Math.max(...daily);
+        maxLoss = Math.min(...daily);
+      }
+    }
+    const avgVolume =
+      hist.length > 0
+        ? Math.round(hist.reduce((s, h) => s + h.volume, 0) / hist.length)
+        : 0;
+    return {
+      row,
+      totalChangePct,
+      avgDailyChange,
+      maxGain,
+      maxLoss,
+      avgVolume,
+      inNews: newsCounts[row.company_id] ?? 0,
+    };
+  });
 
-  // Align by index (all companies share the same trading calendar in the dataset).
-  return seriesByCompany;
+  return { rows: quotesRes.quotes, metrics, newsCounts };
 }
 
 export default function Analysis() {
   const { data, loading, error, reload } = useAsync(loadAnalysis);
 
-  const series = useMemo(
-    () => buildComparisonSeries(data?.market.rows ?? []),
-    [data],
-  );
+  // Comparison chart limited to the busiest names — 240 lines are unreadable.
+  const series = useMemo(() => {
+    const top = [...(data?.metrics ?? [])]
+      .sort((a, b) => b.avgVolume - a.avgVolume)
+      .slice(0, MAX_CHART_SERIES)
+      .map((m) => m.row);
+    return top
+      .filter((r) => r.history.length >= 2)
+      .map((r) => {
+        const base = r.history[0].close || 1;
+        return {
+          symbol: r.symbol,
+          companyId: r.company_id,
+          points: r.history.map((h) => ({
+            date: h.date,
+            pct: Number((((h.close - base) / base) * 100).toFixed(2)),
+          })),
+        };
+      });
+  }, [data]);
 
   const chartData = useMemo(() => {
-    // Merge every company's cumulative % change into rows keyed by date.
     const byDate = new Map<string, Record<string, number>>();
-    series.forEach(({ company, points }) => {
+    series.forEach(({ symbol, points }) => {
       points.forEach((p) => {
         const rowMap = byDate.get(p.date) ?? {};
-        rowMap[company.symbol] = Number(p.pct.toFixed(2));
+        rowMap[symbol] = p.pct;
         byDate.set(p.date, rowMap);
       });
     });
@@ -95,15 +143,8 @@ export default function Analysis() {
 
   const ranked = useMemo(
     () =>
-      [...(data?.market.rows ?? [])]
-        .map((row) => ({
-          row,
-          quoteChange: row.summary?.price_trend?.total_change_pct ?? null,
-          avgVolume: row.summary?.volume_trend?.avg_volume ?? 0,
-          anomalies: row.summary?.anomalies?.count ?? 0,
-          pressure: row.summary?.pressure_summary ?? {},
-          inNews: data?.newsCounts[row.company.id] ?? 0,
-        }))
+      [...(data?.metrics ?? [])]
+        .filter((m) => m.row.quote !== null || m.row.history.length > 0)
         .sort((a, b) => b.avgVolume - a.avgVolume),
     [data],
   );
@@ -116,11 +157,11 @@ export default function Analysis() {
   if (!data) return null;
 
   const bestPerformer = [...ranked]
-    .filter((r) => r.quoteChange !== null)
-    .sort((a, b) => (b.quoteChange ?? 0) - (a.quoteChange ?? 0))[0];
+    .filter((r) => r.totalChangePct !== null)
+    .sort((a, b) => (b.totalChangePct ?? 0) - (a.totalChangePct ?? 0))[0];
   const worstPerformer = [...ranked]
-    .filter((r) => r.quoteChange !== null)
-    .sort((a, b) => (a.quoteChange ?? 0) - (b.quoteChange ?? 0))[0];
+    .filter((r) => r.totalChangePct !== null)
+    .sort((a, b) => (a.totalChangePct ?? 0) - (b.totalChangePct ?? 0))[0];
   const mostInNews = [...ranked].sort((a, b) => b.inNews - a.inNews)[0];
 
   return (
@@ -128,14 +169,15 @@ export default function Analysis() {
       <header className="mb-5.5">
         <h1 className="text-[22px] font-semibold">Analysis — cross-company comparison</h1>
         <p className="mt-1 text-sm text-muted">
-          Side-by-side behavior of the tracked watchlist over the last 30 days.
+          Side-by-side behavior of every listed company over the last 30 days,
+          computed from the synced NEPSE feed.
         </p>
       </header>
 
       {ranked.length === 0 ? (
         <EmptyState
           title="No analysis data"
-          hint="Seed companies and daily prices on the backend, then reload this page."
+          hint="The backend syncs prices automatically at startup and on a schedule — reload once data has arrived."
           action={
             <button onClick={reload} className="rounded-lg border border-panel-border bg-[#1e2430] px-3 py-1.5 text-xs font-medium hover:bg-[#262d3b]">
               Reload
@@ -149,28 +191,28 @@ export default function Analysis() {
               label="Best performer (30d)"
               value={
                 bestPerformer
-                  ? `${bestPerformer.row.company.symbol} ${bestPerformer.quoteChange! >= 0 ? "+" : ""}${bestPerformer.quoteChange!.toFixed(2)}%`
+                  ? `${bestPerformer.row.symbol} ${bestPerformer.totalChangePct! >= 0 ? "+" : ""}${bestPerformer.totalChangePct!.toFixed(2)}%`
                   : "—"
               }
-              tone={bestPerformer && bestPerformer.quoteChange! >= 0 ? "positive" : "negative"}
+              tone={bestPerformer && bestPerformer.totalChangePct! >= 0 ? "positive" : "negative"}
             />
             <StatCard
               label="Worst performer (30d)"
               value={
                 worstPerformer
-                  ? `${worstPerformer.row.company.symbol} ${worstPerformer.quoteChange! >= 0 ? "+" : ""}${worstPerformer.quoteChange!.toFixed(2)}%`
+                  ? `${worstPerformer.row.symbol} ${worstPerformer.totalChangePct! >= 0 ? "+" : ""}${worstPerformer.totalChangePct!.toFixed(2)}%`
                   : "—"
               }
-              tone={worstPerformer && worstPerformer.quoteChange! >= 0 ? "positive" : "negative"}
+              tone={worstPerformer && worstPerformer.totalChangePct! >= 0 ? "positive" : "negative"}
             />
             <StatCard
               label="Most active (avg vol)"
-              value={ranked[0]?.row.company.symbol ?? "—"}
+              value={ranked[0]?.row.symbol ?? "—"}
               sublabel={ranked[0] ? ranked[0].avgVolume.toLocaleString() : undefined}
             />
             <StatCard
               label="Most in news (30d)"
-              value={mostInNews && mostInNews.inNews > 0 ? `${mostInNews.row.company.symbol} (${mostInNews.inNews})` : "—"}
+              value={mostInNews && mostInNews.inNews > 0 ? `${mostInNews.row.symbol} (${mostInNews.inNews})` : "—"}
             />
           </section>
 
@@ -180,7 +222,7 @@ export default function Analysis() {
               Cumulative % change — last 30 days
             </h2>
             <p className="mb-3.5 text-xs text-muted">
-              All companies rebased to 0% at the start of the window for direct comparison.
+              Top {MAX_CHART_SERIES} most-active companies rebased to 0% at the start of the window.
             </p>
             {chartData.length > 1 ? (
               <ResponsiveContainer width="100%" height={360}>
@@ -197,11 +239,11 @@ export default function Analysis() {
                     formatter={(v) => `${Number(v).toFixed(2)}%`}
                   />
                   <Legend wrapperStyle={{ fontSize: 12 }} />
-                  {series.map(({ company }, i) => (
+                  {series.map(({ symbol }, i) => (
                     <Line
-                      key={company.id}
+                      key={symbol}
                       type="monotone"
-                      dataKey={company.symbol}
+                      dataKey={symbol}
                       stroke={LINE_COLORS[i % LINE_COLORS.length]}
                       strokeWidth={2}
                       dot={false}
@@ -212,7 +254,7 @@ export default function Analysis() {
             ) : (
               <EmptyState
                 title="Not enough price history"
-                hint="At least two days of prices per company are required for the comparison chart."
+                hint="At least two days of synced prices per company are required for the comparison chart."
               />
             )}
           </section>
@@ -221,8 +263,8 @@ export default function Analysis() {
           <section className="mb-5 rounded-xl border border-panel-border bg-panel px-5 py-4.5">
             <h2 className="mb-3.5 text-[15px] font-semibold">Average daily volume</h2>
             <ResponsiveContainer width="100%" height={280}>
-              <BarChart data={ranked.map((r) => ({
-                  symbol: r.row.company.symbol,
+              <BarChart data={ranked.slice(0, 15).map((r) => ({
+                  symbol: r.row.symbol,
                   volume: r.avgVolume,
                 }))} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#2a2f3a" />
@@ -241,7 +283,7 @@ export default function Analysis() {
           <section className="rounded-xl border border-panel-border bg-panel px-5 py-4.5">
             <h2 className="mb-3.5 text-[15px] font-semibold">Behavior metrics compared</h2>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[860px] border-collapse">
+              <table className="w-full min-w-[760px] border-collapse">
                 <thead>
                   <tr>
                     {[
@@ -251,9 +293,8 @@ export default function Analysis() {
                       "Max gain",
                       "Max loss",
                       "Avg volume",
-                      "Anomalies",
+                      "Latest price",
                       "In news",
-                      "Pressure mix",
                     ].map((h) => (
                       <th
                         key={h}
@@ -265,66 +306,50 @@ export default function Analysis() {
                   </tr>
                 </thead>
                 <tbody>
-                  {ranked.map(({ row, quoteChange, avgVolume, anomalies, pressure, inNews }) => {
-                    const trend = row.summary?.price_trend;
-                    const pressureStr =
-                      Object.keys(pressure).length > 0
-                        ? Object.entries(pressure)
-                            .map(([k, n]) => `${k.replace(/_/g, " ")}×${n}`)
-                            .join(", ")
-                        : "—";
-                    return (
-                      <tr key={row.company.id} className="transition hover:bg-[#1a1f29]">
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5">
-                          <Link
-                            to={`/companies/${row.company.id}`}
-                            className="text-sm font-semibold hover:text-accent hover:underline"
-                          >
-                            {row.company.symbol}
-                          </Link>
-                          <span className="ml-1.5 hidden text-xs text-muted lg:inline">
-                            {row.company.name}
-                          </span>
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm">
-                          <ChangeBadge pct={quoteChange} />
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-muted">
-                          {trend ? `${trend.avg_daily_change >= 0 ? "+" : ""}${trend.avg_daily_change}%` : "—"}
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-positive">
-                          {trend ? `+${trend.max_daily_gain}%` : "—"}
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-negative">
-                          {trend ? `${trend.max_daily_loss}%` : "—"}
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
-                          {avgVolume ? avgVolume.toLocaleString() : "—"}
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm">
-                          {anomalies > 0 ? (
-                            <span className="rounded-full bg-accent-2/15 px-2 py-0.5 text-xs font-medium text-accent-2">
-                              {anomalies} day(s)
-                            </span>
-                          ) : (
-                            <span className="text-muted">None</span>
-                          )}
-                        </td>
-                        <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
-                          {inNews}
-                        </td>
-                        <td className="max-w-[240px] border-b border-[#1e222c] px-2.5 py-2.5 text-xs capitalize text-muted">
-                          {pressureStr}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  {ranked.map((m) => (
+                    <tr key={m.row.company_id} className="transition hover:bg-[#1a1f29]">
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5">
+                        <Link
+                          to={`/companies/${m.row.company_id}`}
+                          className="text-sm font-semibold hover:text-accent hover:underline"
+                        >
+                          {m.row.symbol}
+                        </Link>
+                        <span className="ml-1.5 hidden text-xs text-muted lg:inline">
+                          {m.row.name}
+                        </span>
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm">
+                        <ChangeBadge pct={m.totalChangePct} />
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-muted">
+                        {m.avgDailyChange !== null
+                          ? `${m.avgDailyChange >= 0 ? "+" : ""}${m.avgDailyChange.toFixed(2)}%`
+                          : "—"}
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-positive">
+                        {m.maxGain !== null ? `+${m.maxGain.toFixed(2)}%` : "—"}
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums text-negative">
+                        {m.maxLoss !== null ? `${m.maxLoss.toFixed(2)}%` : "—"}
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
+                        {m.avgVolume ? m.avgVolume.toLocaleString() : "—"}
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
+                        {m.row.quote ? `Rs ${m.row.quote.price.toFixed(2)}` : "—"}
+                      </td>
+                      <td className="border-b border-[#1e222c] px-2.5 py-2.5 text-sm tabular-nums">
+                        {m.inNews}
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
             <p className="mt-3 text-xs text-muted">
-              Metrics computed server-side from crawled daily OHLCV data
-              (<code className="bg-[#1e222c] px-1 rounded">/behavior-summary</code>) and
+              Metrics computed from the live NEPSE sync stored by the backend
+              (<code className="bg-[#1e222c] px-1 rounded">/api/market/quotes</code>) and
               categorized news counts (<code className="bg-[#1e222c] px-1 rounded">/api/news</code>).
             </p>
           </section>
